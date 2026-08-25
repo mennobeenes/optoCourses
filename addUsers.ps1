@@ -13,6 +13,9 @@ param(
 	[char]$CsvDelimiter = ','
 )
 
+# todo, ask ai to create team, and create assigment with due date and assign automatically to current and new users.
+# probably also assign the teachers/owners.
+
 $ErrorActionPreference = 'Stop'
 
 Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
