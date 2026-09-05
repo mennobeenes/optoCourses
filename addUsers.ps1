@@ -3,9 +3,9 @@ param(
 	[ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
 	[string]$CsvPath = (Join-Path $PSScriptRoot 'users.csv'),
 
-	[string]$TeamName = '173 - HOLTEN',
-
-	[string]$SkuPartNumber = 'STANDARDWOFFPACK_STUDENT',
+	[Parameter(Mandatory)]
+	[ValidateNotNullOrEmpty()]
+	[string]$TeamName,
 
 	[ValidatePattern('^[A-Z]{2}$')]
 	[string]$UsageLocation = 'NL',
@@ -15,6 +15,8 @@ param(
 
 # todo, ask ai to create team, and create assigment with due date and assign automatically to current and new users.
 # probably also assign the teachers/owners.
+
+# run command for highger version powershell: pwsh .\addUsers.ps1 -TeamName "175 - TILBURG"
 
 $ErrorActionPreference = 'Stop'
 
@@ -26,7 +28,7 @@ $requiredScopes = @(
 	'Organization.Read.All'
 	'User.ReadWrite.All'
 )
-Connect-MgGraph -Scopes $requiredScopes -UseDeviceCode -NoWelcome
+Connect-MgGraph -Scopes $requiredScopes -NoWelcome
 
 function Get-GraphCollection {
 	param([Parameter(Mandatory)][string]$Uri)
@@ -62,7 +64,7 @@ if ($rows.Count -eq 0) {
 	throw "CSV file '$CsvPath' contains no users."
 }
 
-$requiredColumns = @('username', 'password', 'privateEmail')
+$requiredColumns = @('username', 'password', 'privateEmail', 'license')
 $columnNames = @($rows[0].PSObject.Properties.Name)
 $missingColumns = @($requiredColumns | Where-Object { $_ -notin $columnNames })
 if ($missingColumns.Count -gt 0) {
@@ -85,35 +87,55 @@ if ($teamMatches.Count -ne 1) {
 $team = $teamMatches[0]
 
 $skus = @(Get-GraphCollection -Uri '/v1.0/subscribedSkus?$select=skuId,skuPartNumber,capabilityStatus,consumedUnits,prepaidUnits')
-$skuMatches = @($skus | Where-Object { $_.skuPartNumber -eq $SkuPartNumber })
-if ($skuMatches.Count -ne 1) {
-	throw "Expected exactly one subscribed SKU '$SkuPartNumber', but found $($skuMatches.Count)."
-}
-$sku = $skuMatches[0]
-if ($sku.capabilityStatus -ne 'Enabled') {
-	throw "Subscribed SKU '$SkuPartNumber' is not enabled."
-}
 
 $memberIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $members = Get-GraphCollection -Uri "/v1.0/groups/$($team.id)/members?`$select=id"
 foreach ($member in $members) {
 	[void]$memberIds.Add([string]$member.id)
 }
+$ownerIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$owners = Get-GraphCollection -Uri "/v1.0/groups/$($team.id)/owners?`$select=id"
+foreach ($owner in $owners) {
+	[void]$ownerIds.Add([string]$owner.id)
+}
 
 $results = foreach ($row in $rows) {
 	$username = ([string]$row.username).Trim()
 	$password = [string]$row.password
 	$privateEmail = ([string]$row.privateEmail).Trim()
+	$skuPartNumber = ([string]$row.license).Trim()
 
 	try {
-		if (-not $username -or -not $password -or -not $privateEmail) {
-			throw 'username, password, and privateEmail must all have a value.'
+		if (-not $username -or -not $skuPartNumber) {
+			throw 'username and license must both have a value.'
 		}
-		if ($username -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$' -or $privateEmail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
-			throw 'username and privateEmail must be valid email addresses.'
+		if ($username -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+			throw 'username must be a valid email address.'
 		}
+		$isFaculty = $skuPartNumber -eq 'STANDARDWOFFPACK_FACULTY'
+		if (-not $isFaculty -and $skuPartNumber -ne 'STANDARDWOFFPACK_STUDENT') {
+			throw "Unsupported license '$skuPartNumber'. Use STANDARDWOFFPACK_STUDENT or STANDARDWOFFPACK_FACULTY."
+		}
+
+		$skuMatches = @($skus | Where-Object { $_.skuPartNumber -eq $skuPartNumber })
+		if ($skuMatches.Count -ne 1) {
+			throw "Expected exactly one subscribed SKU '$skuPartNumber', but found $($skuMatches.Count)."
+		}
+		$sku = $skuMatches[0]
+		if ($sku.capabilityStatus -ne 'Enabled') {
+			throw "Subscribed SKU '$skuPartNumber' is not enabled."
+		}
+
 		$user = Get-EntraUser -UserPrincipalName $username
+		$userAlreadyExists = $null -ne $user
 		if (-not $user) {
+			if (-not $password -or -not $privateEmail) {
+				throw 'password and privateEmail must both have a value when creating a new user.'
+			}
+			if ($privateEmail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+				throw 'privateEmail must be a valid email address.'
+			}
+
 			$mailNickname = ($username.Split('@')[0] -replace '[^a-zA-Z0-9._-]', '')
 			$createBody = @{
 				accountEnabled    = $true
@@ -132,39 +154,38 @@ $results = foreach ($row in $rows) {
 				$user = Invoke-MgGraphRequest -Method POST -Uri '/v1.0/users' -Body ($createBody | ConvertTo-Json -Depth 5)
 			}
 		}
-		else {
-			$remainingEmails = @($user.otherMails | Where-Object { $_ -and $_ -ine $privateEmail })
-			$updateBody = @{
-				otherMails    = @($privateEmail) + $remainingEmails
-				usageLocation = $UsageLocation.ToUpperInvariant()
-			}
-			if ($PSCmdlet.ShouldProcess($username, 'Update private email and usage location')) {
-				Invoke-MgGraphRequest -Method PATCH -Uri "/v1.0/users/$($user.id)" -Body ($updateBody | ConvertTo-Json) | Out-Null
-			}
-		}
 
-		if ($user -and $sku.skuId -notin @($user.assignedLicenses.skuId)) {
+		if (-not $userAlreadyExists -and $user -and $sku.skuId -notin @($user.assignedLicenses.skuId)) {
 			$licenseBody = @{
 				addLicenses    = @(@{ disabledPlans = @(); skuId = $sku.skuId })
 				removeLicenses = @()
 			}
-			if ($PSCmdlet.ShouldProcess($username, "Assign license $SkuPartNumber")) {
+			if ($PSCmdlet.ShouldProcess($username, "Assign license $skuPartNumber")) {
 				Invoke-MgGraphRequest -Method POST -Uri "/v1.0/users/$($user.id)/assignLicense" -Body ($licenseBody | ConvertTo-Json -Depth 5) | Out-Null
 			}
 		}
 
 		if ($user -and -not $memberIds.Contains([string]$user.id)) {
 			$memberBody = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($user.id)" }
-			if ($PSCmdlet.ShouldProcess($username, "Add to Team $TeamName")) {
+			if ($PSCmdlet.ShouldProcess($username, "Add as member to Team $TeamName")) {
 				Invoke-MgGraphRequest -Method POST -Uri "/v1.0/groups/$($team.id)/members/`$ref" -Body ($memberBody | ConvertTo-Json) | Out-Null
 				[void]$memberIds.Add([string]$user.id)
 			}
 		}
 
+		if ($isFaculty -and $user -and -not $ownerIds.Contains([string]$user.id)) {
+			$ownerBody = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($user.id)" }
+			if ($PSCmdlet.ShouldProcess($username, "Add as owner to Team $TeamName")) {
+				Invoke-MgGraphRequest -Method POST -Uri "/v1.0/groups/$($team.id)/owners/`$ref" -Body ($ownerBody | ConvertTo-Json) | Out-Null
+				[void]$ownerIds.Add([string]$user.id)
+			}
+		}
+
 		[pscustomobject]@{
 			Username = $username
+			TeamRole = if ($isFaculty) { 'Owner' } else { 'Member' }
 			Status   = if ($WhatIfPreference) { 'WhatIf' } else { 'Success' }
-			Message  = ''
+			Message  = if ($userAlreadyExists) { 'Existing Entra user; profile and license unchanged.' } else { '' }
 		}
 	}
 	catch {
