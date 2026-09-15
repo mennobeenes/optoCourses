@@ -13,9 +13,6 @@ param(
 	[char]$CsvDelimiter = ','
 )
 
-# todo, ask ai to create team, and create assigment with due date and assign automatically to current and new users.
-# probably also assign the teachers/owners.
-
 # run command for highger version powershell: pwsh .\addUsers.ps1 -TeamName "175 - TILBURG"
 
 $ErrorActionPreference = 'Stop'
